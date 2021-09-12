@@ -1,0 +1,33 @@
+[submodule "cmake"]
+	path = cmake
+	url = https://github.com/Open-Transactions/opentxs-cmake
+[submodule "deps/ChaiScript"]
+	path = deps/ChaiScript
+	url = https://github.com/ChaiScript/ChaiScript.git
+[submodule "deps/lucre"]
+	path = deps/lucre
+	url = https://github.com/Open-Transactions/lucre.git
+[submodule "deps/simpleini"]
+	path = deps/simpleini
+	url = https://github.com/brofield/simpleini.git
+[submodule "deps/smhasher"]
+	path = deps/smhasher
+	url = https://github.com/aappleby/smhasher
+[submodule "deps/SHA1"]
+	path = deps/SHA1
+	url = https://github.com/983/SHA1
+[submodule "deps/vcpkg"]
+	path = deps/vcpkg
+	url = https://github.com/microsoft/vcpkg
+[submodule "src/api/client/blockchain/bech32"]
+	path = deps/bech32
+	url = https://github.com/sipa/bech32
+[submodule "deps/robin-hood"]
+	path = deps/robin-hood
+	url = https://github.com/martinus/robin-hood-hashing
+[submodule "deps/packetcrypt/packetcrypt_rs"]
+	path = deps/packetcrypt/packetcrypt_rs
+	url = https://github.com/cjdelisle/packetcrypt_rs
+[submodule "deps/secp256k1"]
+	path = deps/secp256k1
+	url = https://github.com/Open-Transactions/secp256k1-abc

@@ -1,0 +1,603 @@
+// Copyright (c) 2010-2021 The Open-Transactions developers
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+#include "0_stdafx.hpp"    // IWYU pragma: associated
+#include "1_Internal.hpp"  // IWYU pragma: associated
+#include "ui/accountactivity/CustodialAccountActivity.hpp"  // IWYU pragma: associated
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "internal/api/client/Client.hpp"
+#include "opentxs/Pimpl.hpp"
+#include "opentxs/Shared.hpp"
+#include "opentxs/Types.hpp"
+#include "opentxs/api/Endpoints.hpp"  // IWYU pragma: keep
+#include "opentxs/api/Factory.hpp"
+#include "opentxs/api/Wallet.hpp"
+#include "opentxs/api/client/Manager.hpp"
+#include "opentxs/api/client/PaymentWorkflowState.hpp"
+#include "opentxs/api/client/PaymentWorkflowType.hpp"
+#include "opentxs/api/client/Workflow.hpp"
+#include "opentxs/api/storage/Storage.hpp"
+#include "opentxs/core/Account.hpp"
+#include "opentxs/core/Flag.hpp"
+#include "opentxs/core/Identifier.hpp"
+#include "opentxs/core/Log.hpp"
+#include "opentxs/core/LogSource.hpp"
+#include "opentxs/core/contract/ServerContract.hpp"
+#include "opentxs/core/contract/UnitDefinition.hpp"
+#include "opentxs/core/identifier/Server.hpp"
+#include "opentxs/core/identifier/UnitDefinition.hpp"
+#include "opentxs/network/zeromq/Frame.hpp"
+#include "opentxs/network/zeromq/FrameSection.hpp"
+#include "opentxs/protobuf/PaymentEvent.pb.h"
+#include "opentxs/protobuf/PaymentWorkflow.pb.h"
+#include "opentxs/protobuf/PaymentWorkflowEnums.pb.h"
+#include "ui/base/Widget.hpp"
+
+#define OT_METHOD "opentxs::ui::implementation::CustodialAccountActivity::"
+
+namespace opentxs::factory
+{
+auto CustodialAccountActivityModel(
+    const api::client::Manager& api,
+    const identifier::Nym& nymID,
+    const Identifier& accountID,
+    const SimpleCallback& cb) noexcept
+    -> std::unique_ptr<ui::internal::AccountActivity>
+{
+    using ReturnType = ui::implementation::CustodialAccountActivity;
+
+    return std::make_unique<ReturnType>(api, nymID, accountID, cb);
+}
+}  // namespace opentxs::factory
+
+namespace opentxs::ui::implementation
+{
+CustodialAccountActivity::CustodialAccountActivity(
+    const api::client::Manager& api,
+    const identifier::Nym& nymID,
+    const Identifier& accountID,
+    const SimpleCallback& cb) noexcept
+    : AccountActivity(api, nymID, accountID, AccountType::Custodial, cb, {})
+    , alias_()
+{
+    init({
+        api.Endpoints().AccountUpdate(),
+        api.Endpoints().ContactUpdate(),
+        api.Endpoints().ServerUpdate(),
+        api.Endpoints().UnitUpdate(),
+        api.Endpoints().WorkflowAccountUpdate(),
+    });
+
+    // If an Account exists, then the unit definition and notary contracts must
+    // exist already.
+    OT_ASSERT(0 < Contract().Version());
+    OT_ASSERT(0 < Notary().Version());
+}
+
+auto CustodialAccountActivity::ContractID() const noexcept -> std::string
+{
+    sLock lock(shared_lock_);
+
+    return contract_->ID()->str();
+}
+
+auto CustodialAccountActivity::display_balance(
+    opentxs::Amount amount) const noexcept -> std::string
+{
+    sLock lock(shared_lock_);
+    std::string output{};
+    const auto formatted =
+        contract_->FormatAmountLocale(amount, output, ",", ".");
+
+    if (formatted) { return output; }
+
+    return std::to_string(amount);
+}
+
+auto CustodialAccountActivity::DisplayUnit() const noexcept -> std::string
+{
+    sLock lock(shared_lock_);
+
+    return contract_->TLA();
+}
+
+auto CustodialAccountActivity::extract_event(
+    const proto::PaymentEventType eventType,
+    const proto::PaymentWorkflow& workflow) noexcept -> EventRow
+{
+    bool success{false};
+    bool found{false};
+    EventRow output{};
+    auto& [time, event_p] = output;
+
+    for (const auto& event : workflow.event()) {
+        const auto eventTime = Clock::from_time_t(event.time());
+
+        if (eventType != event.type()) { continue; }
+
+        if (eventTime > time) {
+            if (success) {
+                if (event.success()) {
+                    time = eventTime;
+                    event_p = &event;
+                    found = true;
+                }
+            } else {
+                time = eventTime;
+                event_p = &event;
+                success = event.success();
+                found = true;
+            }
+        } else {
+            if (false == success) {
+                if (event.success()) {
+                    // This is a weird case. It probably shouldn't happen
+                    time = eventTime;
+                    event_p = &event;
+                    success = true;
+                    found = true;
+                }
+            }
+        }
+    }
+
+    if (false == found) {
+        LogOutput(OT_METHOD)(__func__)(": Workflow ")(workflow.id())(", type ")(
+            workflow.type())(", state ")(workflow.state())(
+            " does not contain an event of type ")(eventType)
+            .Flush();
+
+        OT_FAIL;
+    }
+
+    return output;
+}
+
+auto CustodialAccountActivity::extract_rows(
+    const proto::PaymentWorkflow& workflow) noexcept -> std::vector<RowKey>
+{
+    auto output = std::vector<RowKey>{};
+
+    switch (opentxs::api::client::internal::translate(workflow.type())) {
+        case api::client::PaymentWorkflowType::OutgoingCheque: {
+            switch (
+                opentxs::api::client::internal::translate(workflow.state())) {
+                case api::client::PaymentWorkflowState::Unsent:
+                case api::client::PaymentWorkflowState::Conveyed:
+                case api::client::PaymentWorkflowState::Expired: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_CREATE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_CREATE, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Cancelled: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_CREATE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_CREATE, workflow));
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_CANCEL,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_CANCEL, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Accepted:
+                case api::client::PaymentWorkflowState::Completed: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_CREATE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_CREATE, workflow));
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_ACCEPT,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_ACCEPT, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Error:
+                case api::client::PaymentWorkflowState::Initiated:
+                default: {
+                    LogOutput(OT_METHOD)(__func__)(
+                        ": Invalid workflow state (")(workflow.state())(")")
+                        .Flush();
+                }
+            }
+        } break;
+        case api::client::PaymentWorkflowType::IncomingCheque: {
+            switch (
+                opentxs::api::client::internal::translate(workflow.state())) {
+                case api::client::PaymentWorkflowState::Conveyed:
+                case api::client::PaymentWorkflowState::Expired:
+                case api::client::PaymentWorkflowState::Completed: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_CONVEY,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_CONVEY, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Error:
+                case api::client::PaymentWorkflowState::Unsent:
+                case api::client::PaymentWorkflowState::Cancelled:
+                case api::client::PaymentWorkflowState::Accepted:
+                case api::client::PaymentWorkflowState::Initiated:
+                default: {
+                    LogOutput(OT_METHOD)(__func__)(
+                        ": Invalid workflow state (")(workflow.state())(")")
+                        .Flush();
+                }
+            }
+        } break;
+        case api::client::PaymentWorkflowType::OutgoingTransfer: {
+            switch (
+                opentxs::api::client::internal::translate(workflow.state())) {
+                case api::client::PaymentWorkflowState::Acknowledged:
+                case api::client::PaymentWorkflowState::Accepted: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_ACKNOWLEDGE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_ACKNOWLEDGE, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Completed: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_ACKNOWLEDGE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_ACKNOWLEDGE, workflow));
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_COMPLETE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_COMPLETE, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Initiated:
+                case api::client::PaymentWorkflowState::Aborted: {
+                } break;
+                case api::client::PaymentWorkflowState::Error:
+                case api::client::PaymentWorkflowState::Unsent:
+                case api::client::PaymentWorkflowState::Conveyed:
+                case api::client::PaymentWorkflowState::Cancelled:
+                case api::client::PaymentWorkflowState::Expired:
+                default: {
+                    LogOutput(OT_METHOD)(__func__)(
+                        ": Invalid workflow state (")(workflow.state())(")")
+                        .Flush();
+                }
+            }
+        } break;
+        case api::client::PaymentWorkflowType::IncomingTransfer: {
+            switch (
+                opentxs::api::client::internal::translate(workflow.state())) {
+                case api::client::PaymentWorkflowState::Conveyed: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_CONVEY,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_CONVEY, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Completed: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_CONVEY,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_CONVEY, workflow));
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_ACCEPT,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_ACCEPT, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Error:
+                case api::client::PaymentWorkflowState::Unsent:
+                case api::client::PaymentWorkflowState::Cancelled:
+                case api::client::PaymentWorkflowState::Accepted:
+                case api::client::PaymentWorkflowState::Expired:
+                case api::client::PaymentWorkflowState::Initiated:
+                case api::client::PaymentWorkflowState::Aborted:
+                case api::client::PaymentWorkflowState::Acknowledged:
+                default: {
+                    LogOutput(OT_METHOD)(__func__)(
+                        ": Invalid workflow state (")(workflow.state())(")")
+                        .Flush();
+                }
+            }
+        } break;
+        case api::client::PaymentWorkflowType::InternalTransfer: {
+            switch (
+                opentxs::api::client::internal::translate(workflow.state())) {
+                case api::client::PaymentWorkflowState::Acknowledged:
+                case api::client::PaymentWorkflowState::Conveyed:
+                case api::client::PaymentWorkflowState::Accepted: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_ACKNOWLEDGE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_ACKNOWLEDGE, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Completed: {
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_ACKNOWLEDGE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_ACKNOWLEDGE, workflow));
+                    output.emplace_back(
+                        proto::PAYMENTEVENTTYPE_COMPLETE,
+                        extract_event(
+                            proto::PAYMENTEVENTTYPE_COMPLETE, workflow));
+                } break;
+                case api::client::PaymentWorkflowState::Initiated:
+                case api::client::PaymentWorkflowState::Aborted: {
+                } break;
+                case api::client::PaymentWorkflowState::Error:
+                case api::client::PaymentWorkflowState::Unsent:
+                case api::client::PaymentWorkflowState::Cancelled:
+                case api::client::PaymentWorkflowState::Expired:
+                default: {
+                    LogOutput(OT_METHOD)(__func__)(
+                        ": Invalid workflow state (")(workflow.state())(")")
+                        .Flush();
+                }
+            }
+        } break;
+        case api::client::PaymentWorkflowType::Error:
+        case api::client::PaymentWorkflowType::OutgoingInvoice:
+        case api::client::PaymentWorkflowType::IncomingInvoice:
+        default: {
+            LogOutput(OT_METHOD)(__func__)(": Unsupported workflow type (")(
+                workflow.type())(")")
+                .Flush();
+        }
+    }
+
+    return output;
+}
+
+auto CustodialAccountActivity::Name() const noexcept -> std::string
+{
+    sLock lock(shared_lock_);
+
+    return alias_;
+}
+
+auto CustodialAccountActivity::NotaryID() const noexcept -> std::string
+{
+    sLock lock(shared_lock_);
+
+    return notary_->ID()->str();
+}
+
+auto CustodialAccountActivity::NotaryName() const noexcept -> std::string
+{
+    sLock lock(shared_lock_);
+
+    return notary_->EffectiveName();
+}
+
+auto CustodialAccountActivity::pipeline(const Message& in) noexcept -> void
+{
+    if (false == running_.get()) { return; }
+
+    const auto body = in.Body();
+
+    if (1 > body.size()) {
+        LogOutput(OT_METHOD)(__func__)(": Invalid message").Flush();
+
+        OT_FAIL;
+    }
+
+    const auto work = [&] {
+        try {
+
+            return body.at(0).as<Work>();
+        } catch (...) {
+
+            OT_FAIL;
+        }
+    }();
+
+    switch (work) {
+        case Work::notary: {
+            process_notary(in);
+        } break;
+        case Work::unit: {
+            process_unit(in);
+        } break;
+        case Work::contact: {
+            process_contact(in);
+        } break;
+        case Work::account: {
+            process_balance(in);
+        } break;
+        case Work::workflow: {
+            process_workflow(in);
+        } break;
+        case Work::init: {
+            startup();
+            finish_startup();
+        } break;
+        case Work::statemachine: {
+            do_work();
+        } break;
+        case Work::shutdown: {
+            running_->Off();
+            shutdown(shutdown_promise_);
+        } break;
+        default: {
+            LogOutput(OT_METHOD)(__func__)(": Unhandled type").Flush();
+
+            OT_FAIL;
+        }
+    }
+}
+
+auto CustodialAccountActivity::process_balance(const Message& message) noexcept
+    -> void
+{
+    wait_for_startup();
+    const auto body = message.Body();
+
+    OT_ASSERT(2 < body.size())
+
+    auto accountID = Widget::api_.Factory().Identifier();
+    accountID->Assign(body.at(1).Bytes());
+
+    if (account_id_ != accountID) { return; }
+
+    const auto balance = body.at(2).as<Amount>();
+    const auto oldBalance = balance_.exchange(balance);
+    const auto balanceChanged = (oldBalance != balance);
+    const auto alias = [&] {
+        auto account = Widget::api_.Wallet().Account(account_id_);
+
+        OT_ASSERT(account);
+
+        return account.get().Alias();
+    }();
+    const auto aliasChanged = [&] {
+        eLock lock(shared_lock_);
+
+        if (alias != alias_) {
+            alias_ = alias;
+
+            return true;
+        }
+
+        return false;
+    }();
+
+    if (balanceChanged) { notify_balance(balance); }
+
+    if (aliasChanged) { UpdateNotify(); }
+}
+
+auto CustodialAccountActivity::process_contact(const Message& message) noexcept
+    -> void
+{
+    wait_for_startup();
+    // Contact names may have changed, therefore all row texts must be
+    // recalculated
+    startup();
+}
+
+auto CustodialAccountActivity::process_notary(const Message& message) noexcept
+    -> void
+{
+    wait_for_startup();
+    const auto oldName = NotaryName();
+    const auto newName = [&] {
+        {
+            eLock lock{shared_lock_};
+            notary_ = Widget::api_.Wallet().Server(
+                Widget::api_.Storage().AccountServer(account_id_));
+        }
+
+        return NotaryName();
+    }();
+
+    if (oldName != newName) {
+        // TODO Qt widgets need to know that notary name property has changed
+        UpdateNotify();
+    }
+}
+
+auto CustodialAccountActivity::process_workflow(
+    const Identifier& workflowID,
+    std::set<AccountActivityRowID>& active) noexcept -> void
+{
+    const auto workflow = [&] {
+        auto out = proto::PaymentWorkflow{};
+        Widget::api_.Workflow().LoadWorkflow(primary_id_, workflowID, out);
+
+        return out;
+    }();
+    const auto rows = extract_rows(workflow);
+
+    for (const auto& [type, row] : rows) {
+        const auto& [time, event_p] = row;
+        auto key = AccountActivityRowID{Identifier::Factory(workflowID), type};
+        auto custom = CustomData{
+            new proto::PaymentWorkflow(workflow),
+            new proto::PaymentEvent(*event_p)};
+        add_item(key, time, custom);
+        active.emplace(std::move(key));
+    }
+}
+
+auto CustodialAccountActivity::process_workflow(const Message& message) noexcept
+    -> void
+{
+    wait_for_startup();
+    const auto body = message.Body();
+
+    OT_ASSERT(1 < body.size());
+
+    const auto accountID = [&] {
+        auto output = Widget::api_.Factory().Identifier();
+        output->Assign(body.at(1).Bytes());
+
+        return output;
+    }();
+
+    OT_ASSERT(false == accountID->empty())
+
+    if (account_id_ == accountID) { startup(); }
+}
+
+auto CustodialAccountActivity::process_unit(const Message& message) noexcept
+    -> void
+{
+    wait_for_startup();
+    // TODO currently it doesn't matter if the unit definition alias changes
+    // since we don't use it
+    eLock lock{shared_lock_};
+    contract_ = Widget::api_.Wallet().UnitDefinition(
+        Widget::api_.Storage().AccountContract(account_id_));
+}
+
+auto CustodialAccountActivity::startup() noexcept -> void
+{
+    const auto alias = [&] {
+        auto account = Widget::api_.Wallet().Account(account_id_);
+
+        OT_ASSERT(account);
+
+        return account.get().Alias();
+    }();
+    const auto aliasChanged = [&] {
+        eLock lock(shared_lock_);
+
+        if (alias != alias_) {
+            alias_ = alias;
+
+            return true;
+        }
+
+        return false;
+    }();
+
+    const auto workflows =
+        Widget::api_.Workflow().WorkflowsByAccount(primary_id_, account_id_);
+    auto active = std::set<AccountActivityRowID>{};
+
+    for (const auto& id : workflows) { process_workflow(id, active); }
+
+    delete_inactive(active);
+
+    if (aliasChanged) {
+        // TODO Qt widgets need to know the alias property has changed
+        UpdateNotify();
+    }
+}
+
+auto CustodialAccountActivity::Unit() const noexcept -> contact::ContactItemType
+{
+    sLock lock(shared_lock_);
+
+    return contract_->UnitOfAccount();
+}
+
+CustodialAccountActivity::~CustodialAccountActivity()
+{
+    wait_for_startup();
+    stop_worker().get();
+}
+}  // namespace opentxs::ui::implementation
